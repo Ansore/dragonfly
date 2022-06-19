@@ -678,6 +678,28 @@ int getLongLongFromObject(robj *o, long long *target) {
     return C_OK;
 }
 
+int getLongLongFromObjectOrReply(robj *o, long long *target) {
+    long long value;
+    if (getLongLongFromObject(o, &value) != C_OK) {
+        serverPanic("value is not an integer or out of range");
+        return C_ERR;
+    }
+    *target = value;
+    return C_OK;
+}
+
+int getLongFromObjectOrReply(robj *o, long *target) {
+    long long value;
+
+    if (getLongLongFromObjectOrReply(o, &value) != C_OK) return C_ERR;
+    if (value < LONG_MIN || value > LONG_MAX) {
+        serverPanic("value is out of range");
+        return C_ERR;
+    }
+    *target = value;
+    return C_OK;
+}
+
 const char *strEncoding(int encoding) {
     switch(encoding) {
     case OBJ_ENCODING_RAW: return "raw";

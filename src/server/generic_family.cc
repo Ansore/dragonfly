@@ -3,10 +3,17 @@
 //
 
 #include "server/generic_family.h"
+#include <string>
+#include "server/tiered_storage.h"
 
 extern "C" {
+#include "redis/dict.h"
+#include "redis/list.h"
 #include "redis/object.h"
+#include "redis/sds.h"
+#include "redis/set.h"
 #include "redis/util.h"
+#include "redis/zset.h"
 }
 
 #include "base/flags.h"
@@ -204,8 +211,7 @@ bool ScanCb(const OpArgs& op_args, PrimeIterator it, const ScanOpts& opts, Strin
   return true;
 }
 
-void OpScan(const OpArgs& op_args, const ScanOpts& scan_opts, uint64_t* cursor,
-            StringVec* vec) {
+void OpScan(const OpArgs& op_args, const ScanOpts& scan_opts, uint64_t* cursor, StringVec* vec) {
   auto& db_slice = op_args.shard->db_slice();
   DCHECK(db_slice.IsDbValid(op_args.db_ind));
 
@@ -516,6 +522,359 @@ void GenericFamily::Type(CmdArgList args, ConnectionContext* cntx) {
   }
 }
 
+struct SortParams {
+  bool alpha = false;
+  bool desc = false;
+  bool limit = false;
+  long limit_start = 0;
+  long limit_count = -1;
+  bool dontsort = false;
+  bool store = false;
+  bool sortby = false;
+  std::string_view by_pattern;
+};
+
+struct SortObject {
+  robj* obj;
+  union {
+    double score;
+    robj* cmpobj;
+  } u;
+};
+
+bool SortCompareWithParams(SortParams& sort_params, const SortObject& s1, const SortObject& s2) {
+  int cmp;
+  if (!sort_params.alpha) {
+    if (s1.u.score > s2.u.score) {
+      cmp = 1;
+    } else if (s1.u.score < s2.u.score) {
+      cmp = -1;
+    } else {
+      cmp = compareStringObjects(s1.obj, s2.obj);
+    }
+  } else {
+    if (sort_params.sortby) {
+      if (!s1.u.cmpobj || !s2.u.cmpobj) {
+        if (s1.u.cmpobj == s2.u.cmpobj) {
+          cmp = 0;
+        } else if (s1.u.cmpobj == NULL) {
+          cmp = -1;
+        } else {
+          cmp = 1;
+        }
+      } else {
+        if (sort_params.store) {
+          cmp = compareStringObjects(s1.u.cmpobj, s2.u.cmpobj);
+        } else {
+          cmp = std::strcoll((char*)s1.u.cmpobj->ptr, (char*)s2.u.cmpobj->ptr);
+        }
+      }
+    } else {
+      if (sort_params.store) {
+        cmp = compareStringObjects(s1.obj, s2.obj);
+      } else {
+        cmp = collateStringObjects(s1.obj, s2.obj);
+      }
+    }
+  }
+  cmp = sort_params.desc ? -cmp : cmp;
+  return cmp <= 0 ? true : false;
+};
+
+string GetString(EngineShard* shard, const PrimeValue& pv) {
+  string res;
+  if (pv.IsExternal()) {
+    auto* tiered = shard->tiered_storage();
+    auto [offset, size] = pv.GetExternalPtr();
+    res.resize(size);
+
+    error_code ec = tiered->Read(offset, size, res.data());
+    CHECK(!ec) << "TBD: " << ec;
+  } else {
+    pv.GetString(&res);
+  }
+
+  return res;
+}
+
+OpResult<string> OpGet(const OpArgs& op_args, string_view key) {
+  OpResult<PrimeIterator> it_res = op_args.shard->db_slice().Find(op_args.db_ind, key, OBJ_STRING);
+  if (!it_res.ok())
+    return it_res.status();
+
+  const PrimeValue& pv = it_res.value()->second;
+
+  return GetString(op_args.shard, pv);
+}
+
+auto OpSort(SortParams& sort_params, const OpArgs& op_args, string_view key)
+    -> OpResult<StringVec> {
+
+  for (int i = 0; i < 10; i ++) {
+    string_view test_key = string_view{"ttt_" + to_string(i)};
+    OpResult<PrimeIterator> find_res = op_args.shard->db_slice().Find(op_args.db_ind, test_key, OBJ_STRING);
+    LOG(ERROR) << "find key:" << test_key << ", result:" << find_res.status();
+  }
+
+  long start, end;
+  int j, vectorlen = 0;
+  StringVec str_vec;
+  robj* sortval;
+
+  auto it = op_args.shard->db_slice().FindExt(op_args.db_ind, key).first;
+  if (!IsValid(it)) {
+    return OpStatus::KEY_NOTFOUND;
+  }
+  sortval = it->second.AsRObj();
+
+  switch (sortval->type) {
+    case OBJ_LIST:
+      vectorlen = listTypeLength(sortval);
+      break;
+    case OBJ_SET:
+      vectorlen = setTypeSize(sortval);
+      break;
+    case OBJ_ZSET:
+      vectorlen = dictSize(((zset*)sortval->ptr)->dict);
+      break;
+    default:
+      vectorlen = 0;
+      serverPanic("Bad SORT type");
+  }
+
+  start = (sort_params.limit_start < 0) ? 0 : sort_params.limit_start;
+  end = (sort_params.limit_count < 0) ? vectorlen - 1 : start + sort_params.limit_count - 1;
+  if (start >= vectorlen) {
+    start = vectorlen - 1;
+    end = vectorlen - 2;
+  }
+  if (end >= vectorlen) {
+    end = vectorlen - 1;
+  }
+
+  vector<SortObject> sVector(vectorlen);
+  j = 0;
+
+  if (sortval->type == OBJ_LIST && sort_params.dontsort) {
+    if (end >= start) {
+      listTypeIterator* li;
+      listTypeEntry entry;
+
+      li = listTypeInitIterator(
+          sortval, sort_params.desc ? (long)(listTypeLength(sortval) - start - 1) : start,
+          sort_params.desc ? LIST_HEAD : LIST_TAIL);
+      while (j < vectorlen && listTypeNext(li, &entry)) {
+        sVector[j].obj = getDecodedObject(listTypeGet(&entry));
+        sVector[j].u.score = 0;
+        sVector[j].u.cmpobj = NULL;
+        j++;
+      }
+      listTypeReleaseIterator(li);
+      end -= start;
+      start = 0;
+    }
+  } else if (sortval->type == OBJ_LIST) {
+    listTypeIterator* li = listTypeInitIterator(sortval, 0, LIST_TAIL);
+    listTypeEntry entry;
+    while (listTypeNext(li, &entry)) {
+      sVector[j].obj = getDecodedObject(listTypeGet(&entry));
+      sVector[j].u.score = 0;
+      sVector[j].u.cmpobj = NULL;
+      j++;
+    }
+    listTypeReleaseIterator(li);
+  } else if (sortval->type == OBJ_SET) {
+    setTypeIterator* si = setTypeInitIterator(sortval);
+    sds sdsele;
+    while ((sdsele = setTypeNextObject(si)) != NULL) {
+      sVector[j].obj = getDecodedObject(createObject(OBJ_STRING, sdsele));
+      sVector[j].u.score = 0;
+      sVector[j].u.cmpobj = NULL;
+      j++;
+    }
+    setTypeReleaseIterator(si);
+  } else if (sortval->type == OBJ_ZSET && sort_params.dontsort) {
+    zset* zs = (zset*)sortval->ptr;
+    zskiplist* zsl = zs->zsl;
+    zskiplistNode* ln;
+    sds sdsele;
+    int rangelen = vectorlen;
+
+    if (sort_params.desc) {
+      long zsetlen = dictSize(((zset*)sortval->ptr)->dict);
+
+      ln = zsl->tail;
+      if (start > 0)
+        ln = zslGetElementByRank(zsl, zsetlen - start);
+    } else {
+      ln = zsl->header->level[0].forward;
+      if (start > 0)
+        ln = zslGetElementByRank(zsl, start + 1);
+    }
+
+    while (rangelen--) {
+      serverAssertWithInfo(c, sortval, ln != NULL);
+      sdsele = ln->ele;
+      sVector[j].obj = createStringObject(sdsele, sdslen(sdsele));
+      sVector[j].u.score = 0;
+      sVector[j].u.cmpobj = NULL;
+      j++;
+      ln = sort_params.desc ? ln->backward : ln->level[0].forward;
+    }
+    end -= start;
+    start = 0;
+  } else if (sortval->type == OBJ_ZSET) {
+    dict* set = ((zset*)sortval->ptr)->dict;
+    dictIterator* di;
+    dictEntry* setele;
+    sds sdsele;
+    di = dictGetIterator(set);
+    while ((setele = dictNext(di)) != NULL) {
+      sdsele = sdsnew(reinterpret_cast<char*>(dictGetKey(setele)));
+      sVector[j].obj = createStringObject(sdsele, sdslen(sdsele));
+      sVector[j].u.score = 0;
+      sVector[j].u.cmpobj = NULL;
+      j++;
+    }
+    dictReleaseIterator(di);
+  } else {
+    serverPanic("Unknown type");
+  }
+
+  if (!sort_params.dontsort) {
+    for (j = 0; j < vectorlen; j++) {
+      robj* byval;
+      if (sort_params.sortby) {
+        std::string_view byval_key = std::string_view{string(sort_params.by_pattern) +
+                                            reinterpret_cast<char*>(sVector[j].obj->ptr)};
+        // LOG(ERROR) << "find key:" << byval_key;
+        // auto tmp_val = op_args.shard->db_slice().FindExt(op_args.db_ind, byval_key).first;
+        // LOG(ERROR) << "tmp_val type:" << tmp_val->second.ObjType();
+        // LOG(ERROR) << "tmp_val encoding:" << tmp_val->second.Encoding();
+        // if (!IsValid(tmp_val)) {
+        //   continue;
+        // }
+        // string v;
+        // tmp_val->second.GetString(&v);
+        // LOG(ERROR) << "tmp_val null:" << v;
+        // byval = createRawStringObject(std::move(v.data()), tmp_val->second.Size());
+
+        // LOG(ERROR) << "find key:" << string(byval_key);
+        OpResult<PrimeIterator> find_res = op_args.shard->db_slice().Find(op_args.db_ind, byval_key, OBJ_STRING);
+        // LOG(ERROR) << "find result:" << find_res.status();
+        if (!find_res) {
+          continue;
+        }
+        string v;
+        find_res.value()->second.GetString(&v);
+        // LOG(ERROR) << "val:" << v;
+        byval = createRawStringObject(std::move(v.data()), find_res.value()->second.Size());
+        if (!byval)
+          continue;
+      } else {
+        byval = sVector[j].obj;
+      }
+
+      if (sort_params.alpha) {
+        if (sort_params.sortby)
+          sVector[j].u.cmpobj = getDecodedObject(byval);
+      } else {
+        if (sdsEncodedObject(byval)) {
+          char* eptr;
+
+          sVector[j].u.score = std::strtod((char*)byval->ptr, &eptr);
+          LOG(ERROR) << "vector score:" << sVector[j].u.score;
+
+          if (eptr[0] != '\0' || errno == ERANGE || isnan(sVector[j].u.score)) {
+            // int_conversion_error = 1;
+            LOG(ERROR) << "error dont";
+          }
+        } else if (byval->encoding == OBJ_ENCODING_INT) {
+          sVector[j].u.score = (long)byval->ptr;
+        } else {
+          serverAssertWithInfo(c, sortval, 1 != 1);
+        }
+      }
+
+      if (sort_params.sortby) {
+        decrRefCount(byval);
+      }
+    }
+
+    auto cmp_with_parameter = [&](const SortObject& s1, const SortObject& s2) -> bool {
+      return SortCompareWithParams(sort_params, s1, s2);
+    };
+
+    // if (sort_params.sortby && (start != 0 || end != vectorlen - 1)) {
+    //   // qsort_r(vector, vectorlen, sizeof(SortObject), sortCompare, &sort_params);
+    // // _qsort(vector, vectorlen, sizeof(SortObject), sortCompare, start, end);
+    // }
+    // else {
+    std::sort(sVector.begin(), sVector.end(), cmp_with_parameter);
+    // }
+  }
+
+  for (j = start; j <= end; j++) {
+    str_vec.emplace_back(reinterpret_cast<char*>(getDecodedObject(sVector[j].obj)->ptr));
+  }
+  return str_vec;
+}
+
+void GenericFamily::Sort(CmdArgList args, ConnectionContext* cntx) {
+  std::string_view key = ArgS(args, 1);
+
+  SortParams sort_params;
+  for (size_t i = 2; i < args.size(); ++i) {
+    ToUpper(&args[i]);
+
+    string_view cur_arg = ArgS(args, i);
+    int left_args_size = args.size() - i - 1;
+    if (cur_arg == "ALPHA") {
+      sort_params.alpha = true;
+    } else if (cur_arg == "ASC") {
+      sort_params.desc = false;
+    } else if (cur_arg == "DESC") {
+      sort_params.desc = true;
+    } else if (cur_arg == "LIMIT" && left_args_size >= 2) {
+      sort_params.limit = true;
+      if (!absl::SimpleAtoi(ArgS(args, i + 1), &sort_params.limit_start) ||
+          !absl::SimpleAtoi(ArgS(args, i + 2), &sort_params.limit_count)) {
+        (*cntx)->SendError(kInvalidIntErr);
+        return;
+      }
+      i += 2;
+    } else if (cur_arg == "BY" && left_args_size >= 1) {
+      string_view sortby = ArgS(args, i + 1);
+      size_t sortby_index = 0;
+      if ((sortby_index = sortby.find("*")) == string_view::npos) {
+        sort_params.dontsort = true;
+      } else {
+        // TODO don't support Cluster model
+        sort_params.by_pattern = sortby.substr(0, sortby_index);
+        sort_params.sortby = true;
+      }
+      i++;
+    } else if (cur_arg == "STORE" && left_args_size >= 1) {
+      // TODO implement store command
+    } else if (cur_arg == "GET" && left_args_size >= 1) {
+      // TODO implement get command
+    } else {
+      return cntx->reply_builder()->SendError(absl::StrCat("unsupported option ", cur_arg));
+    }
+  }
+
+  auto cb = [&](Transaction* t, EngineShard* shard) -> OpResult<StringVec> {
+    return OpSort(sort_params, OpArgs{shard, t->db_index()}, key);
+  };
+
+  OpResult<StringVec> res = cntx->transaction->ScheduleSingleHopT(std::move(cb));
+  if (!res && res.status() != OpStatus::KEY_NOTFOUND) {
+    return (*cntx)->SendError(res.status());
+  }
+
+  (*cntx)->SendStringArr(*res);
+}
+
 OpResult<void> GenericFamily::RenameGeneric(CmdArgList args, bool skip_exist_dest,
                                             ConnectionContext* cntx) {
   string_view key[2] = {ArgS(args, 1), ArgS(args, 2)};
@@ -743,6 +1102,7 @@ void GenericFamily::Register(CommandRegistry* registry) {
             << CI{"TTL", CO::READONLY | CO::FAST, 2, 1, 1, 1}.HFUNC(Ttl)
             << CI{"PTTL", CO::READONLY | CO::FAST, 2, 1, 1, 1}.HFUNC(Pttl)
             << CI{"TYPE", CO::READONLY | CO::FAST, 2, 1, 1, 1}.HFUNC(Type)
+            << CI{"SORT", CO::READONLY | CO::FAST, -2, 1, 1, 1}.HFUNC(Sort)
             << CI{"UNLINK", CO::WRITE, -2, 1, -1, 1}.HFUNC(Del);
 }
 

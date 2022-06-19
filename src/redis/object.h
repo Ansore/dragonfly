@@ -71,6 +71,8 @@ typedef struct redisObject {
 void decrRefCount(robj *o);
 void decrRefCountVoid(void *o);
 int getLongLongFromObject(robj *o, long long *target);
+int getLongLongFromObjectOrReply(robj *o, long long *target);
+int getLongFromObjectOrReply(robj *o, long *target);
 void incrRefCount(robj *o);
 robj *makeObjectShared(robj *o);
 robj *resetRefCount(robj *obj);
@@ -104,16 +106,8 @@ void listTypeConvert(robj *subject, int enc);
 int objectSetLRUOrLFU(robj *val, long long lfu_freq, long long lru_idle,
                        long long lru_clock, int lru_multiplier);
 
-
-robj *setTypeCreate(sds value);
-int setTypeAdd(robj *subject, sds value);
-int setTypeRemove(robj *subject, sds value);
-int setTypeIsMember(const robj *subject, sds value);
-int setTypeRandomElement(robj *setobj, sds *sdsele, int64_t *llele);
-unsigned long setTypeRandomElements(robj *set, unsigned long count, robj *aux_set);
-unsigned long setTypeSize(const robj *subject);
-void setTypeConvert(robj *subject, int enc);
-
+int compareStringObjects(robj *a, robj *b);
+int collateStringObjects(robj *a, robj *b);
 
 static inline int sdsEncodedObject(const robj *o) {
     return o->encoding == OBJ_ENCODING_RAW || o->encoding == OBJ_ENCODING_EMBSTR;
@@ -154,12 +148,6 @@ typedef struct {
     listTypeIterator *li;
     quicklistEntry entry; /* Entry in quicklist */
 } listTypeEntry;
-
-setTypeIterator *setTypeInitIterator(robj *subject);
-void setTypeReleaseIterator(setTypeIterator *si);
-int setTypeNext(setTypeIterator *si, sds *sdsele, int64_t *llele);
-sds setTypeNextObject(setTypeIterator *si);
-
 
 
 /* hash set interface */

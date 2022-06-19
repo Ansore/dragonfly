@@ -182,4 +182,44 @@ TEST_F(GenericFamilyTest, Scan) {
   EXPECT_THAT(vec, Each(StartsWith("zset")));
 }
 
+TEST_F(GenericFamilyTest, Sort) {
+  // auto resp = Run({"sort", "mylist"});
+  // ASSERT_THAT(resp, ArrLen(5));
+  // EXPECT_THAT(resp.GetVec(), ElementsAre("0", "2", "3", "4", "9"));
+
+  // Run({"lpush", "mylist2", "1", "dda", "ee", "ad", "pps"});
+  // resp = Run({"sort", "mylist2", "alpha"});
+  // ASSERT_THAT(resp, ArrLen(5));
+  // EXPECT_THAT(resp.GetVec(), ElementsAre("1", "ad", "dda", "ee", "pps"));
+  //
+  // resp = Run({"sort", "mylist2", "alpha", "limit", "1", "2"});
+  // ASSERT_THAT(resp, ArrLen(2));
+  // EXPECT_THAT(resp.GetVec(), ElementsAre("ad", "dda"));
+  //
+  // Run({"lpush", "mylist3", "1.1", "3.3", "2.2", "5.5", "4.4"});
+  // resp = Run({"sort", "mylist3"});
+  // ASSERT_THAT(resp, ArrLen(5));
+  // EXPECT_THAT(resp.GetVec(), ElementsAre("1.1", "2.2", "3.3", "4.4", "5.5"));
+  //
+  // resp = Run({"sort", "mylist3", "by", "not-exists-key"});
+  // ASSERT_THAT(resp, ArrLen(5));
+  // EXPECT_THAT(resp.GetVec(), ElementsAre("4.4", "5.5", "2.2", "3.3", "1.1"));
+
+  Run({"lpush", "mylist", "4", "2", "3", "9", "0"});
+  EXPECT_EQ(Run({"set", "ttt_3", "6"}), "OK");
+  EXPECT_EQ(Run({"set", "ttt_4", "5"}), "OK");
+  EXPECT_EQ(Run({"set", "ttt_9", "0"}), "OK");
+  EXPECT_EQ(Run({"set", "ttt_0", "9"}), "OK");
+  EXPECT_EQ(Run({"set", "ttt_2", "7"}), "OK");
+  EXPECT_EQ(Run({"get", "ttt_0"}), "9");
+  EXPECT_EQ(Run({"get", "ttt_2"}), "7");
+  EXPECT_EQ(Run({"get", "ttt_3"}), "6");
+  EXPECT_EQ(Run({"get", "ttt_4"}), "5");
+  EXPECT_EQ(Run({"get", "ttt_9"}), "0");
+  auto resp = Run({"sort", "mylist", "by", "ttt_*"});
+  ASSERT_THAT(resp, ArrLen(5));
+  EXPECT_THAT(resp.GetVec(), ElementsAre("9", "4", "3", "2", "0"));
+  // resp = Run({"sort", "mylist", "by", "cwass*"});
+}
+
 }  // namespace dfly

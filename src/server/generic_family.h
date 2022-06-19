@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include "core/compact_object.h"
 #include "facade/op_status.h"
 #include "server/common.h"
 #include "server/table.h"
@@ -55,6 +56,7 @@ class GenericFamily {
   static void Select(CmdArgList args, ConnectionContext* cntx);
   static void Scan(CmdArgList args, ConnectionContext* cntx);
   static void Type(CmdArgList args, ConnectionContext* cntx);
+  static void Sort(CmdArgList args, ConnectionContext* cntx);
 
   static OpResult<void> RenameGeneric(CmdArgList args, bool skip_exist_dest,
                                       ConnectionContext* cntx);
